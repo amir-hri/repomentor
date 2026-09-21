@@ -1,0 +1,5 @@
+numpy
+python-dotenv
+rank-bm25
+requests
+sentence-transformers
