@@ -1,14 +1,19 @@
+import argparse
 import json
+import os
 import re
 from collections import Counter
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from urllib.parse import quote
 
 import numpy as np
 import requests
+from dotenv import load_dotenv
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
 
+
+load_dotenv()
 
 MODEL_NAME = "qwen3:1.7b"
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
@@ -18,9 +23,17 @@ INITIAL_CANDIDATES = 12
 MAX_FACTS_PER_SOURCE = 2
 MAX_TOTAL_FACTS = 6
 
+# Standard Reciprocal Rank Fusion constant
+RRF_K = 60
+TEST_FILE_PENALTY = 0.75
+
 CHUNKS_PATH = Path("data/chunks.jsonl")
 EMBEDDINGS_PATH = Path("data/embeddings.npy")
 OLLAMA_URL = "http://localhost:11434/api/chat"
+
+# Source links must point at the configured GitLab instance,
+# which may be self-hosted rather than gitlab.com
+GITLAB_BASE_URL = os.getenv("GITLAB_BASE_URL", "https://gitlab.com").rstrip("/")
 
 STOPWORDS = {
     "what", "when", "where", "which", "who", "why", "how",
@@ -28,22 +41,38 @@ STOPWORDS = {
     "into", "about", "handled",
 }
 
+TEST_DIRECTORIES = {"test", "tests", "__tests__", "spec", "specs"}
+
+# Matches citations a model may append on its own, e.g.
+# "[backend/app/crud.py:1-60]", "[1]" or "[Source 2]", without
+# touching code such as "dict[str, int]"
+MODEL_CITATION_PATTERN = re.compile(
+    r"(?:\s*\[(?:[^\]\s]+:\d+(?:-\d+)?|\d+|source[^\]]*)\])+\s*$",
+    re.IGNORECASE,
+)
+
 
 def call_ollama(
     messages: list[dict],
     temperature: float = 0,
 ) -> str:
-    response = requests.post(
-        OLLAMA_URL,
-        json={
-            "model": MODEL_NAME,
-            "messages": messages,
-            "stream": False,
-            "think": False,
-            "options": {"temperature": temperature},
-        },
-        timeout=180,
-    )
+    try:
+        response = requests.post(
+            OLLAMA_URL,
+            json={
+                "model": MODEL_NAME,
+                "messages": messages,
+                "stream": False,
+                "think": False,
+                "options": {"temperature": temperature},
+            },
+            timeout=180,
+        )
+    except requests.ConnectionError as error:
+        raise RuntimeError(
+            f"Could not reach Ollama at {OLLAMA_URL}. "
+            "Make sure Ollama is running, or use --retrieval-only."
+        ) from error
 
     response.raise_for_status()
 
@@ -73,6 +102,43 @@ def load_chunks() -> list[dict]:
                 chunks.append(json.loads(line))
 
     return chunks
+
+
+def load_index() -> dict:
+    """
+    Load chunks, embeddings, the embedding model and the BM25 index once
+    so that several questions can be answered without reloading them.
+    """
+
+    if not CHUNKS_PATH.exists() or not EMBEDDINGS_PATH.exists():
+        raise RuntimeError(
+            "Index files are missing. "
+            "Run chunk_dataset.py and create_embeddings.py first."
+        )
+
+    chunks = load_chunks()
+    embeddings = np.load(EMBEDDINGS_PATH)
+
+    if not chunks:
+        raise RuntimeError(f"No chunks found in {CHUNKS_PATH}.")
+
+    if len(chunks) != len(embeddings):
+        raise RuntimeError(
+            "Chunks and embeddings do not match. "
+            "Run create_embeddings.py again."
+        )
+
+    documents = [
+        tokenize(f"{chunk['file_path']}\n{chunk['content']}")
+        for chunk in chunks
+    ]
+
+    return {
+        "chunks": chunks,
+        "embeddings": embeddings,
+        "embedding_model": SentenceTransformer(EMBEDDING_MODEL),
+        "bm25": BM25Okapi(documents),
+    }
 
 
 def find_related_identifiers(
@@ -114,11 +180,140 @@ def find_related_identifiers(
 
 
 def is_test_file(file_path: str) -> bool:
+    path = PurePosixPath(file_path)
+    name = path.name.lower()
+
+    if any(part.lower() in TEST_DIRECTORIES for part in path.parts[:-1]):
+        return True
+
+    # Common naming conventions for Python and JavaScript/TypeScript tests
     return (
-        "/tests/" in file_path
-        or file_path.startswith("tests/")
-        or file_path.startswith("frontend/tests/")
+        name.startswith("test_")
+        or name.endswith("_test.py")
+        or name == "conftest.py"
+        or ".test." in name
+        or ".spec." in name
     )
+
+
+def asks_about_tests(question: str) -> bool:
+    # Match whole words such as "test", "tests" or "testing",
+    # so that words like "latest" do not count
+    return any(token.startswith("test") for token in tokenize(question))
+
+
+def keyword_ranking(scores: np.ndarray) -> list[int]:
+    """
+    Rank chunks by BM25 score, keeping only chunks that share at least
+    one term with the query. Chunks with a zero score have an arbitrary
+    order and must not receive rank-fusion credit.
+    """
+
+    ranking = np.argsort(scores)[::-1]
+
+    return [int(index) for index in ranking if scores[index] > 0]
+
+
+def reciprocal_rank_fusion(
+    rankings: list[list[int]],
+    item_count: int,
+) -> np.ndarray:
+    combined_scores = np.zeros(item_count)
+
+    for ranking in rankings:
+        for rank, index in enumerate(ranking, start=1):
+            combined_scores[index] += 1 / (RRF_K + rank)
+
+    return combined_scores
+
+
+def retrieve(
+    question: str,
+    index: dict,
+    top_k: int = TOP_K,
+) -> tuple[list[int], list[str]]:
+    """
+    Run the two-pass hybrid retrieval and return the indices of the best
+    chunks (at most one per file) plus the related identifiers found.
+    """
+
+    chunks = index["chunks"]
+    embeddings = index["embeddings"]
+    embedding_model = index["embedding_model"]
+    bm25 = index["bm25"]
+
+    # First retrieval pass
+    question_embedding = embedding_model.encode(
+        question,
+        normalize_embeddings=True,
+    )
+
+    initial_semantic_scores = embeddings @ question_embedding
+    initial_keyword_scores = bm25.get_scores(tokenize(question))
+
+    initial_semantic_ranking = np.argsort(initial_semantic_scores)[::-1]
+    initial_keyword_ranking = keyword_ranking(initial_keyword_scores)
+
+    initial_candidates = list(
+        dict.fromkeys(
+            initial_semantic_ranking[:INITIAL_CANDIDATES].tolist()
+            + initial_keyword_ranking[:INITIAL_CANDIDATES]
+        )
+    )
+
+    # Extract code identifiers from the initial results
+    related_identifiers = find_related_identifiers(
+        question,
+        chunks,
+        initial_candidates,
+    )
+
+    # Second retrieval pass using discovered identifiers
+    expanded_query = f"{question} {' '.join(related_identifiers)}"
+
+    expanded_embedding = embedding_model.encode(
+        expanded_query,
+        normalize_embeddings=True,
+    )
+
+    semantic_scores = np.maximum(
+        initial_semantic_scores,
+        embeddings @ expanded_embedding,
+    )
+
+    keyword_scores = bm25.get_scores(tokenize(expanded_query))
+
+    combined_scores = reciprocal_rank_fusion(
+        [
+            np.argsort(semantic_scores)[::-1].tolist(),
+            keyword_ranking(keyword_scores),
+        ],
+        len(chunks),
+    )
+
+    # Prefer implementation files unless the user asks about tests
+    if not asks_about_tests(question):
+        for chunk_index, chunk in enumerate(chunks):
+            if is_test_file(chunk["file_path"]):
+                combined_scores[chunk_index] *= TEST_FILE_PENALTY
+
+    # Select different files for broader evidence
+    best_indices = []
+    seen_files = set()
+
+    for chunk_index in np.argsort(combined_scores)[::-1]:
+        file_path = chunks[chunk_index]["file_path"]
+
+        if file_path in seen_files:
+            continue
+
+        best_indices.append(int(chunk_index))
+        seen_files.add(file_path)
+
+        if len(best_indices) == top_k:
+            break
+
+    return best_indices, related_identifiers
 
 
 def create_citation(chunk: dict) -> str:
@@ -132,10 +327,41 @@ def create_source_url(chunk: dict) -> str:
     encoded_path = quote(chunk["file_path"])
 
     return (
-        f"https://gitlab.com/{chunk['project_path']}/-/blob/"
+        f"{GITLAB_BASE_URL}/{chunk['project_path']}/-/blob/"
         f"{chunk['last_commit_id']}/{encoded_path}"
         f"#L{chunk['start_line']}-{chunk['end_line']}"
     )
+
+
+def is_none_answer(text: str) -> bool:
+    # Small models sometimes write "NONE." or "- NONE" instead of "NONE"
+    return text.strip().lstrip("-* ").rstrip(".").upper() == "NONE"
+
+
+def parse_facts(result: str, citation: str) -> list[str]:
+    """Turn the model's bullet list into facts with our own citation."""
+
+    if is_none_answer(result):
+        return []
+
+    facts = []
+
+    for line in result.splitlines():
+        line = line.strip()
+
+        if not line.startswith(("- ", "* ")):
+            continue
+
+        # Remove any citation the model added itself.
+        fact = MODEL_CITATION_PATTERN.sub("", line[2:]).strip()
+
+        if fact and not is_none_answer(fact):
+            facts.append(f"- {fact} {citation}")
+
+        if len(facts) == MAX_FACTS_PER_SOURCE:
+            break
+
+    return facts
 
 
 def extract_facts(question: str, chunk: dict) -> list[str]:
@@ -178,170 +404,131 @@ Source:
         temperature=0,
     )
 
-    if result.strip().upper() == "NONE":
-        return []
+    return parse_facts(result, create_citation(chunk))
 
-    citation = create_citation(chunk)
-    facts = []
 
-    for line in result.splitlines():
-        line = line.strip()
+def print_sources(chunks: list[dict]) -> None:
+    print("\nSources:\n")
 
-        if not line.startswith(("- ", "* ")):
-            continue
+    for chunk in chunks:
+        print(create_citation(chunk))
+        print(create_source_url(chunk))
+        print()
 
-        fact = line[2:].strip()
 
-        # Remove any citation the model added itself.
-        fact = re.sub(r"\[[^\]]+\]\s*$", "", fact).strip()
+def answer_question(
+    question: str,
+    index: dict,
+    top_k: int = TOP_K,
+    retrieval_only: bool = False,
+) -> None:
+    best_indices, related_identifiers = retrieve(question, index, top_k)
+    retrieved_chunks = [index["chunks"][i] for i in best_indices]
 
-        if fact:
-            facts.append(f"- {fact} {citation}")
+    print("\nRelated code identifiers:")
 
-        if len(facts) == MAX_FACTS_PER_SOURCE:
+    if related_identifiers:
+        print(", ".join(related_identifiers))
+    else:
+        print("None found")
+
+    # Skip the language model and only show what retrieval found
+    if retrieval_only:
+        print_sources(retrieved_chunks)
+        return
+
+    # Extract grounded facts one source at a time
+    answer_facts = []
+    used_chunks = []
+
+    for chunk in retrieved_chunks:
+        facts = extract_facts(question, chunk)
+
+        if facts:
+            answer_facts.extend(facts)
+            used_chunks.append(chunk)
+
+        if len(answer_facts) >= MAX_TOTAL_FACTS:
             break
 
-    return facts
+    answer_facts = answer_facts[:MAX_TOTAL_FACTS]
+
+    print("\nAnswer:\n")
+
+    if answer_facts:
+        for fact in answer_facts:
+            print(fact)
+    else:
+        print(
+            "- I couldn't find enough evidence in the "
+            "retrieved repository sources."
+        )
+
+    print_sources(used_chunks)
 
 
-# Load indexed data
-chunks = load_chunks()
-embeddings = np.load(EMBEDDINGS_PATH)
-
-if len(chunks) != len(embeddings):
-    raise RuntimeError(
-        "Chunks and embeddings do not match. "
-        "Run create_embeddings.py again."
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Ask grounded questions about the indexed repository.",
+    )
+    parser.add_argument(
+        "question",
+        nargs="?",
+        help="Question to answer. Omit it to start an interactive session.",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=TOP_K,
+        help=f"Number of source files to retrieve (default: {TOP_K}).",
+    )
+    parser.add_argument(
+        "--retrieval-only",
+        action="store_true",
+        help="Show retrieved sources without calling the language model.",
     )
 
-embedding_model = SentenceTransformer(EMBEDDING_MODEL)
+    arguments = parser.parse_args()
 
-documents = [
-    tokenize(f"{chunk['file_path']}\n{chunk['content']}")
-    for chunk in chunks
-]
+    if arguments.top_k < 1:
+        parser.error("--top-k must be at least 1.")
 
-bm25 = BM25Okapi(documents)
+    return arguments
 
-question = input("Ask RepoMentor: ").strip()
 
-if not question:
-    raise ValueError("The question cannot be empty.")
+def main() -> None:
+    arguments = parse_arguments()
+    index = load_index()
 
-# First retrieval pass
-question_embedding = embedding_model.encode(
-    question,
-    normalize_embeddings=True,
-)
+    if arguments.question:
+        answer_question(
+            arguments.question.strip(),
+            index,
+            arguments.top_k,
+            arguments.retrieval_only,
+        )
+        return
 
-initial_semantic_scores = embeddings @ question_embedding
-initial_keyword_scores = bm25.get_scores(tokenize(question))
+    # Interactive session: the index is loaded once for all questions
+    print("Type a question, or press Enter / type 'exit' to quit.")
 
-semantic_ranking = np.argsort(initial_semantic_scores)[::-1]
-keyword_ranking = np.argsort(initial_keyword_scores)[::-1]
+    while True:
+        try:
+            question = input("\nAsk RepoMentor: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
 
-initial_candidates = list(
-    dict.fromkeys(
-        semantic_ranking[:INITIAL_CANDIDATES].tolist()
-        + keyword_ranking[:INITIAL_CANDIDATES].tolist()
-    )
-)
+        if not question or question.lower() in {"exit", "quit"}:
+            break
 
-# Extract code identifiers from the initial results
-related_identifiers = find_related_identifiers(
-    question,
-    chunks,
-    initial_candidates,
-)
+        answer_question(
+            question,
+            index,
+            arguments.top_k,
+            arguments.retrieval_only,
+        )
 
-print("\nRelated code identifiers:")
 
-if related_identifiers:
-    print(", ".join(related_identifiers))
-else:
-    print("None found")
-
-# Second retrieval pass using discovered identifiers
-expanded_query = f"{question} {' '.join(related_identifiers)}"
-
-expanded_embedding = embedding_model.encode(
-    expanded_query,
-    normalize_embeddings=True,
-)
-
-semantic_scores = np.maximum(
-    initial_semantic_scores,
-    embeddings @ expanded_embedding,
-)
-
-keyword_scores = bm25.get_scores(tokenize(expanded_query))
-
-semantic_ranking = np.argsort(semantic_scores)[::-1]
-keyword_ranking = np.argsort(keyword_scores)[::-1]
-
-# Reciprocal Rank Fusion
-combined_scores = np.zeros(len(chunks))
-
-for ranking in (semantic_ranking, keyword_ranking):
-    for rank, index in enumerate(ranking, start=1):
-        combined_scores[index] += 1 / (60 + rank)
-
-# Prefer implementation files unless the user asks about tests
-if "test" not in question.lower():
-    for index, chunk in enumerate(chunks):
-        if is_test_file(chunk["file_path"]):
-            combined_scores[index] *= 0.75
-
-# Select different files for broader evidence
-ranked_indices = np.argsort(combined_scores)[::-1]
-
-best_indices = []
-seen_files = set()
-
-for index in ranked_indices:
-    file_path = chunks[index]["file_path"]
-
-    if file_path in seen_files:
-        continue
-
-    best_indices.append(index)
-    seen_files.add(file_path)
-
-    if len(best_indices) == TOP_K:
-        break
-
-retrieved_chunks = [chunks[index] for index in best_indices]
-
-# Extract grounded facts one source at a time
-answer_facts = []
-used_chunks = []
-
-for chunk in retrieved_chunks:
-    facts = extract_facts(question, chunk)
-
-    if facts:
-        answer_facts.extend(facts)
-        used_chunks.append(chunk)
-
-    if len(answer_facts) >= MAX_TOTAL_FACTS:
-        break
-
-answer_facts = answer_facts[:MAX_TOTAL_FACTS]
-
-print("\nAnswer:\n")
-
-if answer_facts:
-    for fact in answer_facts:
-        print(fact)
-else:
-    print(
-        "- I couldn't find enough evidence in the "
-        "retrieved repository sources."
-    )
-
-print("\nSources:\n")
-
-for chunk in used_chunks:
-    print(create_citation(chunk))
-    print(create_source_url(chunk))
-    print()
+if __name__ == "__main__":
+    main()

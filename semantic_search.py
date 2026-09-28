@@ -1,10 +1,17 @@
 import json
+import os
 from pathlib import Path
 from urllib.parse import quote
 
 import numpy as np
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 
+
+load_dotenv()
+
+# Links must point at the configured (possibly self-hosted) GitLab instance
+gitlab_url = os.getenv("GITLAB_BASE_URL", "https://gitlab.com").rstrip("/")
 
 chunks_path = Path("data/chunks.jsonl")
 embeddings_path = Path("data/embeddings.npy")
@@ -40,7 +47,7 @@ for rank, index in enumerate(best_indices, start=1):
 
     encoded_path = quote(chunk["file_path"])
     source_url = (
-        f"https://gitlab.com/{chunk['project_path']}/-/blob/"
+        f"{gitlab_url}/{chunk['project_path']}/-/blob/"
         f"{chunk['last_commit_id']}/{encoded_path}"
         f"#L{chunk['start_line']}-{chunk['end_line']}"
     )
