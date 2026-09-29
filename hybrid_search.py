@@ -51,6 +51,10 @@ semantic_ranking = np.argsort(semantic_scores)[::-1]
 keyword_scores = bm25.get_scores(tokenize(question))
 keyword_ranking = np.argsort(keyword_scores)[::-1]
 
+# Chunks without any matching term have an arbitrary order,
+# so they must not receive rank-fusion credit
+keyword_ranking = keyword_ranking[keyword_scores[keyword_ranking] > 0]
+
 # Reciprocal Rank Fusion combines the two rankings
 combined_scores = np.zeros(len(chunks))
 

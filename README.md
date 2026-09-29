@@ -191,6 +191,9 @@ repomentor/
 ├── hybrid_search.py
 ├── expanded_hybrid_search.py
 ├── rag_answer.py
+├── evaluate_retrieval.py
+├── evaluation/
+│   └── retrieval_questions.example.json
 └── data/                       # Generated locally; ignored by Git
     ├── repository_files.jsonl
     ├── chunks.jsonl
@@ -331,9 +334,44 @@ python rag_answer.py
 
 Example:
 
+This starts an interactive session. The index and embedding model are loaded once, so you can ask several questions in a row. Press Enter or type `exit` to quit.
+
 ```text
 Ask RepoMentor: How does user authentication work?
 ```
+
+You can also pass a question directly and adjust retrieval:
+
+```bash
+# Answer a single question and exit
+python rag_answer.py "How are user passwords handled?"
+
+# Retrieve 8 source files instead of 5
+python rag_answer.py "How does deployment work?" --top-k 8
+
+# Show retrieved sources only, without calling Ollama
+python rag_answer.py "Where are database models defined?" --retrieval-only
+```
+
+### 12. Evaluate retrieval (optional)
+
+Create `evaluation/retrieval_questions.json` from the example file and list, for each question, the files that should be retrieved:
+
+```bash
+cp evaluation/retrieval_questions.example.json evaluation/retrieval_questions.json
+python evaluate_retrieval.py --top-k 5
+```
+
+```json
+[
+  {
+    "question": "How are user passwords handled?",
+    "expected_files": ["backend/app/core/security.py", "backend/app/crud.py"]
+  }
+]
+```
+
+The script runs the same retrieval pipeline as `rag_answer.py` (no LLM calls) and reports file-level **Hit@K**, **Recall@K**, and **MRR@K**, plus the expected files each question missed. Use it to compare chunking, embedding, and ranking changes objectively.
 
 ## Configuration and Security
 
@@ -386,12 +424,12 @@ Small models can cite the wrong source number even when the correct evidence was
 - Access control currently depends on the configured GitLab token rather than individual application users.
 - The project currently supports one configured repository per run.
 - There is no web interface yet.
-- Retrieval and generation evaluation are not yet automated.
+- Retrieval evaluation requires a hand-written question set; generation evaluation is not yet automated.
 
 ## Roadmap
 
 - [ ] Refactor ingestion, chunking, retrieval, and generation into reusable modules.
-- [ ] Add retrieval evaluation with Hit@K, Recall@K, and expected-file ground truth.
+- [x] Add retrieval evaluation with Hit@K, Recall@K, and expected-file ground truth.
 - [ ] Add answer-level citation and faithfulness evaluation.
 - [ ] Add code-aware chunking with Tree-sitter.
 - [ ] Add a reranking model for top retrieval candidates.

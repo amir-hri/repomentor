@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-gitlab_url = os.getenv("GITLAB_BASE_URL")
+gitlab_url = (os.getenv("GITLAB_BASE_URL") or "").rstrip("/")
 gitlab_token = os.getenv("GITLAB_TOKEN")
 project_path = os.getenv("GITLAB_PROJECT_PATH")
 
